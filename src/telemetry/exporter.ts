@@ -9,6 +9,7 @@
  */
 
 import type { OTelExportRequest, OTelSpan, OTelAttribute, TelemetryConfig } from "./types.js";
+import { redactString } from "../guardrails/redaction.js";
 
 export function attr(key: string, value: string | number | boolean): OTelAttribute {
   if (typeof value === "string") return { key, value: { stringValue: value } };
@@ -40,8 +41,24 @@ export class OTelExporter {
 
     const now = Date.now();
 
+    // Redact PII from all span attributes before export
+    const redactedSpans = spans.map((span) => ({
+      ...span,
+      attributes: span.attributes.map((attr) => ({
+        key: attr.key,
+        value: this.redactAttributeValue(attr.value),
+      })),
+    }));
+    const redactedBuffer = this.retryBuffer.map((span) => ({
+      ...span,
+      attributes: span.attributes.map((attr) => ({
+        key: attr.key,
+        value: this.redactAttributeValue(attr.value),
+      })),
+    }));
+
     // Merge retry buffer with new spans (retry buffer goes first — it's older)
-    const toExport = [...this.retryBuffer, ...spans];
+    const toExport = [...redactedBuffer, ...redactedSpans];
     this.retryBuffer = [];
 
     if (this.config.stdoutExport) {
@@ -121,6 +138,13 @@ export class OTelExporter {
     if (!res.ok) {
       throw new Error(`OTLP endpoint returned HTTP ${res.status}: ${res.statusText}`);
     }
+  }
+
+  private redactAttributeValue(value: OTelAttribute["value"]): OTelAttribute["value"] {
+    if ("stringValue" in value && typeof value.stringValue === "string") {
+      return { stringValue: redactString(value.stringValue) };
+    }
+    return value;
   }
 
   private emitToStdout(spans: OTelSpan[]): void {

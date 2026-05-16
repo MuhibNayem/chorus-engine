@@ -26,16 +26,50 @@ const DEFAULT_MAX_PATTERNS = 100;
 /** Maximum trajectories to retain in memory. Prevents OOM in long-running sessions. */
 const DEFAULT_MAX_TRAJECTORIES = 1_000;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TrajectoryStore — abstraction for trajectory persistence
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface TrajectoryStore {
+  /** Append a trajectory to the store. */
+  append(trajectory: ToolTrajectory): Promise<void>;
+  /** Retrieve all stored trajectories. */
+  list(): Promise<ToolTrajectory[]>;
+  /** Remove old trajectories, keeping at most `maxCount`. */
+  trim(maxCount: number): Promise<void>;
+}
+
+/** In-memory trajectory store (default). Suitable for single-process deployments. */
+export class InMemoryTrajectoryStore implements TrajectoryStore {
+  private trajectories: ToolTrajectory[] = [];
+
+  async append(trajectory: ToolTrajectory): Promise<void> {
+    this.trajectories.push(trajectory);
+  }
+
+  async list(): Promise<ToolTrajectory[]> {
+    return [...this.trajectories];
+  }
+
+  async trim(maxCount: number): Promise<void> {
+    if (this.trajectories.length > maxCount) {
+      this.trajectories = this.trajectories.slice(-maxCount);
+    }
+  }
+}
+
 export interface SynthesizerOptions {
   similarityThreshold?: number;
   minTrajectories?: number;
   maxPatterns?: number;
   maxTrajectories?: number;
+  /** Custom trajectory store. Defaults to InMemoryTrajectoryStore. */
+  store?: TrajectoryStore;
 }
 
 export class TrajectorySynthesizer {
   private registry: SkillRegistry;
-  private trajectories: ToolTrajectory[] = [];
+  private store: TrajectoryStore;
   private similarityThreshold: number;
   private minTrajectories: number;
   private maxPatterns: number;
@@ -43,6 +77,7 @@ export class TrajectorySynthesizer {
 
   constructor(registry: SkillRegistry, opts: SynthesizerOptions = {}) {
     this.registry = registry;
+    this.store = opts.store ?? new InMemoryTrajectoryStore();
     this.similarityThreshold = opts.similarityThreshold ?? DEFAULT_SIMILARITY_THRESHOLD;
     this.minTrajectories = opts.minTrajectories ?? DEFAULT_MIN_TRAJECTORIES;
     this.maxPatterns = opts.maxPatterns ?? DEFAULT_MAX_PATTERNS;
@@ -50,35 +85,32 @@ export class TrajectorySynthesizer {
   }
 
   /** Observe a trajectory after a round completes. */
-  observe(trajectory: ToolTrajectory): void {
-    this.trajectories.push(trajectory);
-
-    // Prevent unbounded memory growth in long-running sessions.
-    if (this.trajectories.length > this.maxTrajectories) {
-      this.trajectories = this.trajectories.slice(-this.maxTrajectories);
-    }
+  async observe(trajectory: ToolTrajectory): Promise<void> {
+    await this.store.append(trajectory);
+    await this.store.trim(this.maxTrajectories);
 
     // Only consider successful trajectories for synthesis
     if (!trajectory.success) return;
 
     // Find similar trajectories
-    const similar = this.findSimilar(trajectory);
+    const similar = await this.findSimilar(trajectory);
     if (similar.length >= this.minTrajectories - 1) {
       const all = [trajectory, ...similar];
       const pattern = this.synthesize(all);
       if (pattern) {
-        this.registry.registerPattern(pattern);
+        await this.registry.registerPattern(pattern);
         this.registry.savePattern(pattern);
       }
     }
   }
 
   /** Find trajectories similar to the given one. */
-  private findSimilar(trajectory: ToolTrajectory): ToolTrajectory[] {
+  private async findSimilar(trajectory: ToolTrajectory): Promise<ToolTrajectory[]> {
     const targetNames = trajectory.tools.map((t) => t.name);
     const similar: ToolTrajectory[] = [];
+    const all = await this.store.list();
 
-    for (const other of this.trajectories) {
+    for (const other of all) {
       if (other.id === trajectory.id) continue;
       if (!other.success) continue;
 

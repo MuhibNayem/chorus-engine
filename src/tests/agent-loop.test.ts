@@ -50,9 +50,12 @@ describe("runAgentLoop — production runtime tests", () => {
       events.push(event);
     }
 
-    expect(events.map((e) => e.type)).toEqual(["token", "checkpoint", "done"]);
-    expect((events[0] as { type: "token"; text: string }).text).toBe("Hello");
-    expect((events[2] as { type: "done"; response: string }).response).toBe("Hello world");
+    expect(events.map((e) => e.type)).toEqual([
+      "checkpoint-loaded", "round-start", "middleware-before", "stream-start",
+      "token", "stream-end", "checkpoint", "done",
+    ]);
+    expect((events[4] as { type: "token"; text: string }).text).toBe("Hello");
+    expect((events[7] as { type: "done"; response: string }).response).toBe("Hello world");
   });
 
   it("retries on retryable stream error before any tokens are yielded", async () => {
@@ -108,8 +111,11 @@ describe("runAgentLoop — production runtime tests", () => {
       events.push(event);
     }
 
-    expect(events.map((e) => e.type)).toEqual(["token", "error"]);
-    expect(events[1].fatal).toBe(true);
+    expect(events.map((e) => e.type)).toEqual([
+      "checkpoint-loaded", "round-start", "middleware-before", "stream-start",
+      "token", "stream-end", "error",
+    ]);
+    expect(events[6].fatal).toBe(true);
   });
 
   it("fatals on truncated stream without done event", async () => {
@@ -134,8 +140,11 @@ describe("runAgentLoop — production runtime tests", () => {
       events.push(event);
     }
 
-    expect(events.map((e) => e.type)).toEqual(["token", "error"]);
-    expect(events[1].fatal).toBe(true);
+    expect(events.map((e) => e.type)).toEqual([
+      "checkpoint-loaded", "round-start", "middleware-before", "stream-start",
+      "token", "stream-end", "error",
+    ]);
+    expect(events[6].fatal).toBe(true);
   });
 
   it("executes tool calls and yields tool events", async () => {

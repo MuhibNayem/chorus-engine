@@ -9,7 +9,7 @@ import {
 } from "../index.js";
 import type { SwarmAgent, WorkerEventCallback, SubagentEventCallback } from "../index.js";
 
-describe("@chorus/engine smoke tests", () => {
+describe("chorus-engine smoke tests", () => {
   it("HitlGate resolves approve correctly", async () => {
     const gate = new HitlGate();
     const key = "test-resume-key";

@@ -1,0 +1,103 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Build, Test & Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag matches version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) != package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+          echo "✓ Version $TAG_VERSION verified"
+
+      - name: Verify clean working tree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree is not clean"
+            git status
+            exit 1
+          fi
+          echo "✓ Working tree is clean"
+
+      - name: Install
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Verify build output
+        run: |
+          test -f dist/index.js || (echo "Missing dist/index.js" && exit 1)
+          test -f dist/index.d.ts || (echo "Missing dist/index.d.ts" && exit 1)
+          test -f dist/agent/index.js || (echo "Missing dist/agent/index.js" && exit 1)
+          test -f dist/agent/index.d.ts || (echo "Missing dist/agent/index.d.ts" && exit 1)
+          test -f dist/swarm/index.js || (echo "Missing dist/swarm/index.js" && exit 1)
+          test -f dist/swarm/index.d.ts || (echo "Missing dist/swarm/index.d.ts" && exit 1)
+          test -f dist/llm/index.js || (echo "Missing dist/llm/index.js" && exit 1)
+          test -f dist/llm/index.d.ts || (echo "Missing dist/llm/index.d.ts" && exit 1)
+          test -f dist/tools/index.js || (echo "Missing dist/tools/index.js" && exit 1)
+          test -f dist/tools/index.d.ts || (echo "Missing dist/tools/index.d.ts" && exit 1)
+          test -f dist/evals/index.js || (echo "Missing dist/evals/index.js" && exit 1)
+          test -f dist/evals/index.d.ts || (echo "Missing dist/evals/index.d.ts" && exit 1)
+          test -f dist/mcp/index.js || (echo "Missing dist/mcp/index.js" && exit 1)
+          test -f dist/mcp/index.d.ts || (echo "Missing dist/mcp/index.d.ts" && exit 1)
+          test -f dist/harness/index.js || (echo "Missing dist/harness/index.js" && exit 1)
+          test -f dist/harness/index.d.ts || (echo "Missing dist/harness/index.d.ts" && exit 1)
+          echo "✓ All build outputs verified"
+
+      - name: Verify package contents
+        run: |
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+          if (!pkg.files) { console.error('Missing files field'); process.exit(1); }
+          for (const file of pkg.files) {
+            if (!fs.existsSync(file)) {
+              console.error('Missing file in files array:', file);
+              process.exit(1);
+            }
+          }
+          console.log('✓ Package files verified');
+          "
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true

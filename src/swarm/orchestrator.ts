@@ -155,6 +155,16 @@ export async function* runSwarm(config: SwarmConfig): AsyncGenerator<SwarmEvent>
       tracer.record(taggedEvent);
       yield taggedEvent;
 
+      if (event.type === "handoff") {
+        handoffPayload = {
+          targetAgent: event.targetAgent,
+          taskDescription: event.taskDescription,
+          artifacts: event.artifacts,
+          reasoning: event.reasoning,
+        };
+      }
+
+      // Backward-compat: also detect JSON-based handoffs from tool-done events
       if (event.type === "tool-done") {
         try {
           const parsed = JSON.parse(event.result) as unknown;

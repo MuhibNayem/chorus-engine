@@ -1,5 +1,5 @@
 {
-  "name": "@chorus/engine",
+  "name": "chorus-engine",
   "version": "0.1.0",
   "description": "Headless agent engine — streaming loop, HITL, DAG swarms, adaptive skills, MCP, A2A",
   "type": "module",
@@ -37,21 +37,48 @@
     "./harness": {
       "import": "./dist/harness/index.js",
       "types": "./dist/harness/index.d.ts"
+    },
+    "./graph": {
+      "import": "./dist/graph/index.js",
+      "types": "./dist/graph/index.d.ts"
     }
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "license": "MIT",
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "swarm",
+    "multi-agent",
+    "mcp",
+    "a2a",
+    "typescript",
+    "headless",
+    "orchestration",
+    "autonomous"
+  ],
   "scripts": {
     "build": "rm -rf dist && tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/pg": "^8.20.0",
     "glob": "^13.0.6",
+    "pg": "^8.20.0",
     "tiktoken": "^1.0.0",
     "zod": "^3.23.0"
   },

@@ -21,7 +21,7 @@ export interface CompactionResult {
 }
 
 export async function shouldCompact(
-  messages: Array<{ role: string; content: string; reasoning_content?: string }>,
+  messages: ReadonlyArray<{ role: string; content: string; reasoning_content?: string }>,
   systemPrompt: string,
   contextWindow?: number
 ): Promise<boolean> {
@@ -31,7 +31,7 @@ export async function shouldCompact(
 }
 
 async function selectRecentMessages(
-  messages: Array<{ role: string; content: string; reasoning_content?: string }>,
+  messages: ReadonlyArray<{ role: string; content: string; reasoning_content?: string }>,
   keepTokens: number
 ): Promise<{
   recentMessages: Array<{ role: string; content: string; reasoning_content?: string }>;
@@ -70,7 +70,7 @@ async function selectRecentMessages(
 }
 
 export async function compactMessages(
-  messages: Array<{ role: string; content: string; reasoning_content?: string }>,
+  messages: ReadonlyArray<{ role: string; content: string; reasoning_content?: string }>,
   systemPrompt: string,
   contextWindow?: number
 ): Promise<CompactionResult> {
@@ -117,13 +117,13 @@ Provide a single summary paragraph.`;
 }
 
 export async function trimToWindow(
-  messages: Array<{ role: string; content: string; reasoning_content?: string }>,
+  messages: ReadonlyArray<{ role: string; content: string; reasoning_content?: string }>,
   systemPrompt: string,
   budget?: number
 ): Promise<Array<{ role: string; content: string; reasoning_content?: string }>> {
   const targetBudget = budget ?? KEEP_RECENT_TOKENS;
   let currentTokens = await Promise.resolve(countMessagesTokens(messages, systemPrompt));
-  if (currentTokens <= targetBudget) return messages;
+  if (currentTokens <= targetBudget) return [...messages];
 
   const result = [...messages];
   // Drop oldest non-system messages until under budget

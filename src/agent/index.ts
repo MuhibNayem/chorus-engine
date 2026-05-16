@@ -4,6 +4,8 @@ export type { AgentMiddleware, RoundContext, ToolResultContext, CompactResult } 
 export { SummarizationMiddleware, ObservabilityMiddleware, LargeOutputOffloadMiddleware, TodoMiddleware, createDefaultMiddleware } from "./middleware.js";
 export { HitlGate } from "./hitl.js";
 export { JsonFileCheckpointer } from "./checkpointer.js";
+export { DurableCheckpointer, detectCrashedRun, recoverFromCrash } from "./durable-checkpointer.js";
+export type { DurabilityMode, CheckpointEvent, DurableCheckpoint } from "./durable-checkpointer.js";
 export { BtwQueue } from "./btw.js";
 export { createMemoryTools, createSharedMemoryTools } from "./memory-tools.js";
 export { withRetry, DEFAULT_RETRY_POLICY } from "./retry.js";

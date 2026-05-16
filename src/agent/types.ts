@@ -2,6 +2,7 @@ import type { ApprovalPolicy } from "../harness/types.js";
 import type { ChatMessage, LLMProvider, ModelResponse, ToolCall, ToolDef } from "../llm/provider.js";
 import type { AgentMiddleware } from "./middleware.js";
 import type { InProcessTracer } from "../telemetry/inprocess.js";
+import type { GuardrailsConfig } from "../guardrails/index.js";
 import type { ZodTypeAny } from "zod";
 
 /**
@@ -31,6 +32,23 @@ export type HitlRequest = {
   description?: string;
 };
 
+/**
+ * First-class control-flow exception for agent handoffs.
+ * Thrown by handoff tools and caught by the agent loop to yield a native
+ * `handoff` event, bypassing fragile JSON parsing.
+ */
+export class HandoffSignal extends Error {
+  constructor(
+    public readonly targetAgent: string,
+    public readonly taskDescription: string,
+    public readonly artifacts: string[],
+    public readonly reasoning?: string,
+  ) {
+    super(`Handoff to ${targetAgent}: ${taskDescription}`);
+    this.name = "HandoffSignal";
+  }
+}
+
 export type AgentEvent =
   | { type: "token"; text: string }
   | { type: "thinking"; text: string }
@@ -43,7 +61,20 @@ export type AgentEvent =
   | { type: "compacted"; removedMessages: number; savedTokens: number }
   | { type: "done"; response: string; reasoning: string; toolCount: number; history: ChatMessage[]; inputTokens: number; outputTokens: number; costUsd: number; durationMs: number }
   | { type: "error"; message: string; fatal: boolean }
-  | { type: "aborted"; message?: string };
+  | { type: "aborted"; message?: string }
+  // Structured lifecycle events (OpenTelemetry-aligned)
+  | { type: "round-start"; round: number; threadId: string; messageCount: number }
+  | { type: "round-end"; round: number; threadId: string; toolCallsThisRound: number }
+  | { type: "guardrail-triggered"; guardrail: string; severity: "info" | "warning" | "critical"; action: "halt" | "warn"; message: string }
+  | { type: "memory-recall"; scope: string; query: string; resultsCount: number }
+  | { type: "memory-compact"; scope: string; removedMessages: number; factsExtracted: number }
+  | { type: "checkpoint-saved"; round: number; threadId: string; mode?: string }
+  | { type: "checkpoint-loaded"; round: number; threadId: string; restored: boolean }
+  | { type: "stream-start"; round: number; threadId: string; model: string }
+  | { type: "stream-end"; round: number; threadId: string; tokensEmitted: number }
+  | { type: "middleware-before"; round: number; hook: string }
+  | { type: "middleware-after"; round: number; hook: string }
+  | { type: "handoff"; targetAgent: string; taskDescription: string; artifacts: string[]; reasoning?: string };
 
 export type CheckpointState = {
   messages: ChatMessage[];
@@ -111,4 +142,9 @@ export interface LoopOptions {
    * the loop emits spans for agent turns and tool calls.
    */
   tracer?: InProcessTracer;
+  /**
+   * Guardrails configuration for input, output, and tool validation.
+   * When provided, guardrails run at the appropriate lifecycle boundaries.
+   */
+  guardrails?: GuardrailsConfig;
 }

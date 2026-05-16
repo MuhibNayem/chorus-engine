@@ -11,6 +11,7 @@ import { buildAuthProvider, getAuthStatus, PersistentClientCredentialsProvider }
 
 type McpToolDef = Awaited<ReturnType<Client["listTools"]>>["tools"][number];
 type McpResourceDef = Awaited<ReturnType<Client["listResources"]>>["resources"][number];
+type McpPromptDef = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
 
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error" | "reconnecting";
 
@@ -23,6 +24,7 @@ type ManagedConnection = {
   lastHealthCheck: number;
   tools: McpToolDef[];
   resources: McpResourceDef[];
+  prompts: McpPromptDef[];
   state: ConnectionState;
   error?: string;
   consecutiveFailures: number;
@@ -42,6 +44,7 @@ export type McpServerStatus = {
   state: ConnectionState;
   toolCount: number;
   resourceCount: number;
+  promptCount: number;
   error?: string;
   authType: string;
   needsAuth: boolean;
@@ -125,6 +128,7 @@ async function connectServer(config: McpServerConfig): Promise<ManagedConnection
     lastHealthCheck: 0,
     tools: [],
     resources: [],
+    prompts: [],
     state: "connecting",
     consecutiveFailures: 0,
   };
@@ -135,13 +139,15 @@ async function connectServer(config: McpServerConfig): Promise<ManagedConnection
 
     await withTimeout(managed.client.connect(managed.transport), timeoutMs, `MCP server "${config.name}" startup`);
 
-    const [toolResult, resourceResult] = await Promise.allSettled([
+    const [toolResult, resourceResult, promptResult] = await Promise.allSettled([
       withTimeout(managed.client.listTools(), timeoutMs, `MCP server "${config.name}" tools/list`),
       withTimeout(managed.client.listResources(), timeoutMs, `MCP server "${config.name}" resources/list`),
+      withTimeout(managed.client.listPrompts(), timeoutMs, `MCP server "${config.name}" prompts/list`),
     ]);
 
     managed.tools = toolResult.status === "fulfilled" ? toolResult.value.tools : [];
     managed.resources = resourceResult.status === "fulfilled" ? resourceResult.value.resources : [];
+    managed.prompts = promptResult.status === "fulfilled" ? promptResult.value.prompts : [];
     managed.connectedAt = Date.now();
     managed.lastHealthCheck = Date.now();
     managed.state = "connected";
@@ -408,6 +414,65 @@ function createToolWrapper(connection: ManagedConnection, tool: McpToolDef): Mcp
   };
 }
 
+function createPromptTools(connection: ManagedConnection): McpTool[] {
+  const server = connection.config.name;
+  return [
+    {
+      name: namespacedToolName(server, "list_prompts"),
+      description: `[MCP:${server}] List prompt templates exposed by this MCP server.`,
+      schema: { type: "object", properties: {}, additionalProperties: false },
+      mcpServerName: server,
+      mcpReadOnly: true,
+      async invoke() {
+        const result = await connection.client.listPrompts();
+        return capMcpOutput(
+          result.prompts
+            .map((p) => `${p.name}  ${p.description ?? ""}`)
+            .join("\n") || "(no MCP prompts)",
+          connection.config,
+        );
+      },
+    },
+    {
+      name: namespacedToolName(server, "get_prompt"),
+      description: `[MCP:${server}] Get a prompt template by name from this MCP server.`,
+      schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Prompt name to retrieve." },
+          arguments: {
+            type: "object",
+            description: "Optional key-value arguments to substitute into the prompt template.",
+            additionalProperties: true,
+          },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+      mcpServerName: server,
+      mcpReadOnly: true,
+      async invoke(input: unknown) {
+        const params = input as { name?: string; arguments?: Record<string, string> };
+        if (!params.name) throw new Error("Missing required MCP prompt name.");
+        const result = await connection.client.getPrompt({ name: params.name, arguments: params.arguments });
+        const messages = result.messages
+          .map((m) => {
+            if (m.content.type === "text") return m.content.text;
+            if (m.content.type === "image") return `[Image ${m.content.mimeType}]`;
+            if (m.content.type === "resource") {
+              const r = m.content.resource;
+              return "text" in r ? `[Resource ${r.uri}]\n${r.text}` : `[Resource ${r.uri}]`;
+            }
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n\n");
+        return capMcpOutput(messages, connection.config);
+      },
+    },
+  ];
+}
+
 function createResourceTools(connection: ManagedConnection): McpTool[] {
   const server = connection.config.name;
   return [
@@ -459,6 +524,7 @@ export async function getMcpTools(): Promise<McpTool[]> {
     return [
       ...connection.tools.map((tool) => createToolWrapper(connection, tool)),
       ...createResourceTools(connection),
+      ...createPromptTools(connection),
     ];
   });
 }
@@ -477,6 +543,7 @@ export async function getMcpStatus(): Promise<McpServerStatus[]> {
       state: connection?.state ?? "disconnected",
       toolCount: connection?.tools.length ?? 0,
       resourceCount: connection?.resources.length ?? 0,
+      promptCount: connection?.prompts.length ?? 0,
       error: connection?.error,
       authType: auth.type,
       needsAuth: auth.needsAuth,

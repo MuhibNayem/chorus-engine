@@ -27,7 +27,7 @@ import type { ChatMessage } from "../llm/provider.js";
 
 const DEFAULT_OPTIONS: Required<SkillHarnessOptions> = {
   skillDirs: [],
-  similarityThreshold: 0.0,
+  similarityThreshold: 0.55,
   maxSkillsPerTurn: 6,
   maxPatternsPerTurn: 3,
   minTrajectoriesForSynthesis: 3,

@@ -15,7 +15,7 @@ export function countTokens(text: string): number {
 }
 
 export function countMessagesTokens(
-  messages: Array<{ role: string; content: string; reasoning_content?: string }>,
+  messages: ReadonlyArray<{ role: string; content: string; reasoning_content?: string }>,
   systemPrompt: string
 ): number {
   const serialized = [

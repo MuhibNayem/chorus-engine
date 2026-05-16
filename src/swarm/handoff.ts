@@ -1,10 +1,12 @@
 import { z } from "zod";
 import type { ChatMessage } from "../llm/provider.js";
-import type { AgentTool } from "../agent/types.js";
+import { HandoffSignal, type AgentTool } from "../agent/types.js";
 import type { HandoffRequest, SwarmAgent, SwarmSession } from "./types.js";
 
+/** @deprecated Kept for backward-compat with JSON-based handoff detection. */
 const HANDOFF_SENTINEL = "__swarm_handoff__";
 
+/** @deprecated Use HandoffSignal instead. */
 export function isHandoffResult(result: unknown): result is HandoffRequest {
   return (
     result !== null &&
@@ -100,14 +102,7 @@ export function createHandoffTools(
       async invoke(input) {
         const { taskDescription, artifacts = [], reasoning } =
           input as { taskDescription: string; artifacts?: string[]; reasoning?: string };
-        const request: HandoffRequest & { __type: string } = {
-          __type: HANDOFF_SENTINEL,
-          targetAgent: destName,
-          taskDescription,
-          artifacts,
-          reasoning,
-        };
-        return JSON.stringify(request);
+        throw new HandoffSignal(destName, taskDescription, artifacts, reasoning);
       },
     };
   });

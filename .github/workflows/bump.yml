@@ -1,0 +1,70 @@
+name: Version Bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options: [patch, minor, major, prerelease]
+      prerelease-id:
+        description: 'Prerelease identifier (e.g. alpha, beta)'
+        required: false
+        default: 'alpha'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: version
+        run: |
+          OLD=$(node -p "require('./package.json').version")
+          if [ "${{ inputs.bump }}" = "prerelease" ]; then
+            npm version prerelease --preid=${{ inputs.prerelease-id }} --no-git-tag-version
+          else
+            npm version ${{ inputs.bump }} --no-git-tag-version
+          fi
+          NEW=$(node -p "require('./package.json').version")
+          echo "old=$OLD" >> $GITHUB_OUTPUT
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "chore: bump version ${{ steps.version.outputs.old }} → ${{ steps.version.outputs.new }}"
+          branch: "chore/bump-${{ steps.version.outputs.new }}"
+          commit-message: "chore: bump version to ${{ steps.version.outputs.new }}"
+          body: |
+            ## Version Bump
+            - **From**: ${{ steps.version.outputs.old }}
+            - **To**: ${{ steps.version.outputs.new }}
+            - **Type**: ${{ inputs.bump }}
+
+            ## Post-Merge
+            After merging, tag and push to trigger publish:
+            ```bash
+            git checkout main && git pull
+            git tag v${{ steps.version.outputs.new }}
+            git push origin v${{ steps.version.outputs.new }}
+            ```
+          labels: "release"

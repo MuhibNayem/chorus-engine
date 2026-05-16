@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run tests with coverage
+        if: matrix.node == '22'
+        run: npm run test:coverage
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-node-${{ matrix.node }}
+          path: |
+            vitest-report.xml
+            coverage/
+          if-no-files-found: ignore
+
+      - name: Upload coverage to Codecov
+        if: matrix.node == '22' && github.event_name == 'pull_request'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: false
+
+  build-outputs:
+    name: Verify Build Outputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify subpath exports exist
+        run: |
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+          const exports = pkg.exports || {};
+          let failed = false;
+          for (const [key, paths] of Object.entries(exports)) {
+            const importPath = typeof paths === 'string' ? paths : paths?.import;
+            if (!importPath) continue;
+            const file = importPath.replace(/^\.\/dist\//, 'dist/');
+            if (!fs.existsSync(file)) {
+              console.error('Missing export file:', file, 'for', key);
+              failed = true;
+            } else {
+              console.log('✓', key, '→', file);
+            }
+          }
+          if (failed) process.exit(1);
+          console.log('✓ All subpath exports verified');
+          "
+
+      - name: Verify types are emitted
+        run: |
+          test -f dist/index.d.ts || (echo "Missing dist/index.d.ts" && exit 1)
+          test -f dist/agent/index.d.ts || (echo "Missing dist/agent/index.d.ts" && exit 1)
+          test -f dist/swarm/index.d.ts || (echo "Missing dist/swarm/index.d.ts" && exit 1)
+          test -f dist/llm/index.d.ts || (echo "Missing dist/llm/index.d.ts" && exit 1)
+          test -f dist/tools/index.d.ts || (echo "Missing dist/tools/index.d.ts" && exit 1)
+          test -f dist/evals/index.d.ts || (echo "Missing dist/evals/index.d.ts" && exit 1)
+          test -f dist/mcp/index.d.ts || (echo "Missing dist/mcp/index.d.ts" && exit 1)
+          test -f dist/harness/index.d.ts || (echo "Missing dist/harness/index.d.ts" && exit 1)
+          echo "✓ All type definitions verified"
+
+  analyze:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check for secrets in source
+        run: |
+          FOUND=$(grep -rEn "(api[_-]?key|apikey|secret|password|passwd|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{20,}['\"]" src/ --include='*.ts' | grep -v 'placeholder\|\.\.\.\|e\.g\.\|example\|requireValue\|process\.env\|\\${\|ENV_VAR\|MY_TOKEN\|envVar' || true)
+          if [ -n "$FOUND" ]; then
+            echo "⚠ Potential hardcoded secrets found:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "✓ No hardcoded secrets detected"
+
+      - name: Verify package.json
+        run: |
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+          const required = ['name','version','description','main','types','exports','engines','license'];
+          const missing = required.filter(k => !pkg[k]);
+          if (missing.length) { console.error('Missing fields:', missing.join(', ')); process.exit(1); }
+          if (!pkg.files || !pkg.files.includes('dist')) { console.error('Missing dist in files'); process.exit(1); }
+          if (!pkg.scripts.build) { console.error('Missing build script'); process.exit(1); }
+          if (!pkg.scripts.test) { console.error('Missing test script'); process.exit(1); }
+          if (!pkg.scripts.typecheck) { console.error('Missing typecheck script'); process.exit(1); }
+          console.log('✓ package.json valid');
+          "
+
+      - name: Check for TypeScript strictness
+        run: |
+          node -e "
+          const fs = require('fs');
+          const ts = JSON.parse(fs.readFileSync('tsconfig.json','utf8'));
+          if (!ts.compilerOptions?.strict) { console.error('strict: true is required'); process.exit(1); }
+          if (ts.compilerOptions?.noImplicitAny === false) { console.error('noImplicitAny must be true'); process.exit(1); }
+          console.log('✓ TypeScript strict mode verified');
+          "
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Check for known vulnerable patterns
+        run: |
+          # Check for eval() usage in source
+          FOUND=$(grep -rEn "\beval\s*(" src/ --include='*.ts' | grep -v 'node_modules' || true)
+          if [ -n "$FOUND" ]; then
+            echo "⚠ eval() usage found:"
+            echo "$FOUND"
+            exit 1
+          fi
+          # Check for Function constructor usage
+          FOUND=$(grep -rEn "new\s+Function\s*(" src/ --include='*.ts' | grep -v 'node_modules' || true)
+          if [ -n "$FOUND" ]; then
+            echo "⚠ new Function() usage found:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "✓ No dangerous code patterns detected"

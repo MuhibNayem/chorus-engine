@@ -1,140 +1,31 @@
-import { z } from "zod";
-import type { ChatMessage, ModelResponse, ToolCall, ToolDef, ToolStreamEvent } from "../llm/provider.js";
-import { DEFAULT_RETRY_POLICY, isRetryable, withRetry } from "./retry.js";
+import type { ChatMessage, ModelResponse, ToolCall } from "../llm/provider.js";
 import type { AgentMiddleware, RoundContext } from "./middleware.js";
-import type { AgentEvent, AgentTool, HitlDecision, HitlRequest, LoopOptions } from "./types.js";
+import { HandoffSignal, type AgentEvent, type AgentTool, type HitlDecision, type HitlRequest, type LoopOptions } from "./types.js";
 import { estimateCost } from "../llm/pricing.js";
 import type { InProcessTracer, MutableSpan } from "../telemetry/inprocess.js";
-
-/**
- * Wraps a streaming iterable with a per-chunk timeout deadline.
- * Throws if no chunk (token/done) arrives within `timeoutMs` milliseconds.
- * The deadline resets after each received chunk, so fast streams are never
- * penalized — only hung providers that stall mid-stream.
- */
-async function* withStreamTimeout<T extends ToolStreamEvent>(
-  source: AsyncIterable<T>,
-  timeoutMs: number,
-): AsyncGenerator<T> {
-  const iter = source[Symbol.asyncIterator]();
-  try {
-    while (true) {
-      const timeoutError = new Error(`Provider stream timed out after ${timeoutMs}ms`);
-      const result = await Promise.race([
-        iter.next(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(timeoutError), timeoutMs),
-        ),
-      ]);
-      if (result.done) break;
-      yield result.value;
-    }
-  } finally {
-    await iter.return?.();
-  }
-}
-
-/**
- * Consumes the LLM provider stream with automatic retry for transient failures.
- *
- * Design:
- *   • Retryable errors that occur BEFORE any tokens are yielded → silent retry
- *     with exponential backoff. The consumer sees no partial output.
- *   • Errors that occur AFTER tokens have been yielded → fatal. We cannot retry
- *     without duplicating already-emitted tokens.
- *   • Truncated streams (end without `done`) → retry if no tokens emitted,
- *     otherwise fatal.
- *   • Non-retryable errors → fatal immediately.
- */
-type StreamConsumptionEvent =
-  | { type: "token"; text: string }
-  | { type: "thinking"; text: string }
-  | { type: "stream-done"; response: ModelResponse; inputTokens: number; outputTokens: number }
-  | { type: "stream-error"; message: string; fatal: boolean };
-
-async function* consumeStream(
-  provider: LoopOptions["provider"],
-  model: string,
-  messages: ChatMessage[],
-  systemPrompt: string,
-  toolDefs: ToolDef[],
-  streamTimeoutMs: number | undefined,
-): AsyncGenerator<StreamConsumptionEvent> {
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let yieldedAny = false;
-    try {
-      const rawStream = provider.streamWithTools({ model, messages, systemPrompt, tools: toolDefs });
-      const stream = streamTimeoutMs ? withStreamTimeout(rawStream, streamTimeoutMs) : rawStream;
-      let response: ModelResponse | null = null;
-      let inputTokens = 0;
-      let outputTokens = 0;
-
-      for await (const event of stream) {
-        if (event.type === "token") {
-          yieldedAny = true;
-          yield { type: "token", text: event.text };
-          continue;
-        }
-        if (event.type === "thinking") {
-          yieldedAny = true;
-          yield { type: "thinking", text: event.text };
-          continue;
-        }
-        if (event.type === "done") {
-          response = event.response;
-          if (response.usage) {
-            inputTokens = response.usage.inputTokens;
-            outputTokens = response.usage.outputTokens;
-          }
-          break;
-        }
-      }
-
-      if (!response) {
-        // Stream ended without a completion event — provider bug or truncation.
-        if (attempt < maxAttempts && !yieldedAny) {
-          await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** attempt, 8_000)));
-          continue;
-        }
-        yield {
-          type: "stream-error",
-          message: `Provider stream ended without completion${yieldedAny ? " after emitting partial tokens" : ""}.`,
-          fatal: true,
-        };
-        return;
-      }
-
-      yield { type: "stream-done", response, inputTokens, outputTokens };
-      return;
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      if (attempt < maxAttempts && isRetryable(err) && !yieldedAny) {
-        await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** attempt, 8_000)));
-        continue;
-      }
-      yield { type: "stream-error", message: err.message, fatal: true };
-      return;
-    }
-  }
-}
+import { runGuardrails, shouldHalt, BuiltInGuardrails } from "../guardrails/index.js";
+import type { GuardrailsConfig, GuardrailViolation } from "../guardrails/index.js";
+import {
+  consumeStream,
+  type StreamConsumptionEvent,
+  toolDefsFromTools,
+  normalizeToolCallArgs,
+  safeArgs,
+  executeToolCall,
+} from "./loop-utils.js";
 
 type ToolByName = Map<string, AgentTool>;
 
-function normalizeToolCallArgs(toolCall: ToolCall): Record<string, unknown> {
-  const raw = toolCall.function.arguments.trim();
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    throw new Error("Tool arguments must be a JSON object.");
-  } catch (error) {
-    throw new Error(
-      `Invalid JSON arguments for ${toolCall.function.name}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
+function mergeAssistantMessage(
+  history: readonly ChatMessage[],
+  response: ModelResponse,
+): ChatMessage[] {
+  return [...history, {
+    role: "assistant",
+    content: response.content,
+    ...(response.reasoning_content ? { reasoning_content: response.reasoning_content } : {}),
+    ...(response.tool_calls ? { tool_calls: response.tool_calls } : {}),
+  }];
 }
 
 function toHitlRequests(toolCalls: ToolCall[]): HitlRequest[] {
@@ -145,150 +36,38 @@ function toHitlRequests(toolCalls: ToolCall[]): HitlRequest[] {
   }));
 }
 
-function safeArgs(toolCall: ToolCall): Record<string, unknown> {
-  try {
-    return normalizeToolCallArgs(toolCall);
-  } catch {
-    return { _raw: toolCall.function.arguments };
-  }
-}
-
-function toolDefsFromTools(tools: AgentTool[]): ToolDef[] {
-  return tools
-    .filter((tool): tool is AgentTool & { name: string } => typeof tool.name === "string" && tool.name.length > 0)
-    .map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name!,
-        description: tool.description,
-        parameters: zodToJsonSchema(tool.schema, tool.name),
-      },
-    }));
-}
-
-function zodToJsonSchema(schema: unknown, toolName?: string): Record<string, unknown> {
-  if (schema instanceof z.ZodType) {
-    return normalizeZodSchema(schema);
-  }
-  if (schema && typeof schema === "object" && !Array.isArray(schema)) {
-    const maybeSchema = schema as Record<string, unknown>;
-    if (
-      typeof maybeSchema.type === "string" ||
-      (maybeSchema.properties !== null && typeof maybeSchema.properties === "object" && !Array.isArray(maybeSchema.properties)) ||
-      Array.isArray(maybeSchema.required)
-    ) {
-      return maybeSchema;
-    }
-  }
-  // Schema was provided but did not match Zod or JSON-Schema shapes — warn
-  // so developers know parameter validation has been stripped for this tool.
-  if (schema !== undefined && schema !== null) {
-    process.stderr.write(
-      `[chorus] Warning: tool "${toolName ?? "unknown"}" has an unrecognised schema ` +
-      `(expected Zod schema or JSON-Schema object). Falling back to open object schema. ` +
-      `Parameter validation will be skipped.\n`,
-    );
-  }
-  return { type: "object", properties: {}, additionalProperties: true };
-}
-
-function normalizeZodSchema(schema: z.ZodTypeAny): Record<string, unknown> {
-  if (schema instanceof z.ZodOptional || schema instanceof z.ZodDefault) {
-    return normalizeZodSchema(schema._def.innerType);
-  }
-  if (schema instanceof z.ZodString) {
-    return { type: "string" };
-  }
-  if (schema instanceof z.ZodNumber) {
-    return { type: "number" };
-  }
-  if (schema instanceof z.ZodBoolean) {
-    return { type: "boolean" };
-  }
-  if (schema instanceof z.ZodEnum) {
-    return { type: "string", enum: [...schema.options] };
-  }
-  if (schema instanceof z.ZodArray) {
-    return { type: "array", items: normalizeZodSchema(schema.element) };
-  }
-  if (schema instanceof z.ZodObject) {
-    const shape = schema.shape;
-    const properties: Record<string, unknown> = {};
-    const required: string[] = [];
-    for (const [key, value] of Object.entries(shape)) {
-      const field = value as z.ZodTypeAny;
-      properties[key] = normalizeZodSchema(field);
-      if (!(field instanceof z.ZodOptional) && !(field instanceof z.ZodDefault)) {
-        required.push(key);
-      }
-    }
-    return {
-      type: "object",
-      properties,
-      ...(required.length > 0 ? { required } : {}),
-      additionalProperties: false,
-    };
-  }
-  return { type: "object", properties: {}, additionalProperties: true };
-}
-
-function mergeAssistantMessage(
-  history: ChatMessage[],
-  response: ModelResponse,
-): void {
-  history.push({
-    role: "assistant",
-    content: response.content,
-    ...(response.reasoning_content ? { reasoning_content: response.reasoning_content } : {}),
-    ...(response.tool_calls ? { tool_calls: response.tool_calls } : {}),
-  });
-}
-
-async function executeToolCall(
-  toolCall: ToolCall,
-  toolsByName: ToolByName,
-): Promise<{ result: string; attempts: number }> {
-  const tool = toolsByName.get(toolCall.function.name);
-  if (!tool) {
-    throw new Error(`Unknown tool: ${toolCall.function.name}`);
-  }
-
-  const args = normalizeToolCallArgs(toolCall);
-  const { value, attempts } = await withRetry(
-    async () => tool.invoke(args),
-    DEFAULT_RETRY_POLICY,
-  );
-
-  return {
-    result: typeof value === "string" ? value : JSON.stringify(value, null, 2),
-    attempts,
-  };
-}
-
 function applyHitlDecision(
   decision: HitlDecision,
-  history: ChatMessage[],
-): "continue" | "stop" {
+  history: readonly ChatMessage[],
+): ChatMessage[] {
   if (decision.type === "reject") {
-    history.push({
+    return [...history, {
       role: "user",
       content: decision.message?.trim() || "Tool execution denied by user.",
-    });
-    return "stop";
+    }];
   }
-  return "continue";
+  return [...history];
 }
 
-/**
- * Execute middleware hooks grouped by priority. Hooks within the same priority
- * run in parallel via `Promise.all`; priority groups run sequentially from
- * lowest to highest. This eliminates linear I/O latency when multiple
- * middlewares perform independent work (e.g., logging + RAG fetch).
- *
- * Hooks with ordering semantics (`beforeTool` cancellation, `afterTool`
- * transformation chaining, `maybeCompact` first-wins) remain sequential and
- * are NOT routed through this helper.
- */
+/** Run guardrails and yield events for any violations. */
+async function* runGuardrailChecks<T>(
+  guardrails: Array<(ctx: T) => Promise<GuardrailViolation | null>>,
+  ctx: T,
+  opts?: { runAll?: boolean; haltOn?: import("../guardrails/index.js").GuardrailSeverity; span?: MutableSpan },
+): AsyncGenerator<AgentEvent, GuardrailViolation[]> {
+  const violations = await runGuardrails(guardrails, ctx, opts);
+  for (const v of violations) {
+    yield {
+      type: "guardrail-triggered",
+      guardrail: v.guardrail,
+      severity: v.severity,
+      action: v.action,
+      message: v.message,
+    };
+  }
+  return violations;
+}
+
 /**
  * Execute middleware hooks grouped by priority. Hooks within the same priority
  * run in parallel via `Promise.all`; priority groups run sequentially from
@@ -344,14 +123,17 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
     streamTimeoutMs,
     outputSchema,
     tracer,
+    guardrails,
   } = options;
 
   const saved = await checkpointer.load(threadId);
+  const restoreFromCheckpoint = saved?.waitingForHitl != null;
+  yield { type: "checkpoint-loaded", round: saved?.round ?? 0, threadId, restored: restoreFromCheckpoint };
+
   // Only restore when a HITL-paused run exists for this thread. A completed turn
   // also writes a checkpoint, but the caller's messages array already contains the
   // new user turn and must not be overridden.
-  const restoreFromCheckpoint = saved?.waitingForHitl != null;
-  const history = restoreFromCheckpoint ? saved!.messages : messages;
+  let history: ChatMessage[] = [...(restoreFromCheckpoint ? saved!.messages : messages)];
 
   let round = restoreFromCheckpoint ? saved!.round : 0;
   let totalTools = 0;
@@ -370,13 +152,31 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
       return;
     }
     for (const text of btwQueue.drain()) {
-      history.push({ role: "user", content: `[/btw] ${text}` });
+      history = [...history, { role: "user", content: `[/btw] ${text}` }];
       yield { type: "btw", text };
+    }
+
+    yield { type: "round-start", round, threadId, messageCount: history.length };
+
+    // Input guardrails (run against raw system prompt; effective prompt not yet built)
+    if (guardrails?.inputs && guardrails.inputs.length > 0) {
+      const inputViolations = yield* runGuardrailChecks(
+        guardrails.inputs,
+        { messages: history, systemPrompt, threadId, round },
+        { runAll: guardrails.runAll, haltOn: guardrails.haltOn },
+      );
+      if (shouldHalt(inputViolations, guardrails.haltOn)) {
+        if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan, { error: "Input guardrail halted" }));
+        if (tracer) await tracer.export(spansToExport);
+        yield { type: "error", message: `Input guardrail violation(s): ${inputViolations.map((v) => v.guardrail).join(", ")}`, fatal: true };
+        return;
+      }
     }
 
     // Middleware: beforeRound
     const roundCtx: RoundContext = { round, threadId, model, history, toolCallsThisRound: 0 };
     await runMiddleware(middleware, "beforeRound", roundCtx);
+    yield { type: "middleware-before", round, hook: "beforeRound" };
 
     // Rebuild tools + system prompt each round (enables per-turn skill routing)
     const allTools = [...tools, ...middleware.flatMap((mw) => mw.extraTools?.() ?? [])];
@@ -406,7 +206,7 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
       if (!mw.maybeCompact) continue;
       const compactResult = await mw.maybeCompact(history, { model, systemPrompt: effectiveSystemPrompt });
       if (compactResult) {
-        history.splice(0, history.length, ...compactResult.replacement);
+        history = compactResult.replacement;
         yield { type: "compacted", removedMessages: compactResult.removedMessages, savedTokens: compactResult.savedTokens };
         break;
       }
@@ -419,8 +219,11 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
     });
 
     let response: ModelResponse | null = null;
+    let tokensEmitted = 0;
+    yield { type: "stream-start", round, threadId, model };
     for await (const event of consumeStream(provider, model, history, effectiveSystemPrompt, toolDefs, streamTimeoutMs)) {
       if (event.type === "token") {
+        tokensEmitted++;
         yield { type: "token", text: event.text };
         continue;
       }
@@ -435,6 +238,7 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
         break;
       }
       if (event.type === "stream-error") {
+        yield { type: "stream-end", round, threadId, tokensEmitted };
         if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan, { error: event.message }));
         yield { type: "error", message: event.message, fatal: event.fatal };
         if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan, { error: event.message }));
@@ -442,6 +246,8 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
         return;
       }
     }
+
+    yield { type: "stream-end", round, threadId, tokensEmitted };
 
     if (!response) {
       // Safety net: consumeStream should always produce either stream-done or stream-error,
@@ -454,7 +260,7 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
       return;
     }
 
-    mergeAssistantMessage(history, response);
+    history = mergeAssistantMessage(history, response);
 
     if (!response.tool_calls || response.tool_calls.length === 0) {
       // Issue 15: Validate response against outputSchema before accepting it as final.
@@ -467,11 +273,27 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
             `Your response must be a valid JSON object matching the required schema. ` +
             `Validation error: ${err instanceof Error ? err.message : String(err)}. ` +
             `Please respond with a valid JSON object only — no prose, no markdown fences.`;
-          history.push({ role: "user", content: correctionMsg });
+          history = [...history, { role: "user", content: correctionMsg }];
           round += 1;
           await checkpointer.save(threadId, { messages: history, round });
           yield { type: "checkpoint", round, threadId };
           continue;
+        }
+      }
+
+      // Output guardrails
+      if (guardrails?.outputs && guardrails.outputs.length > 0) {
+        const outputViolations = yield* runGuardrailChecks(
+          guardrails.outputs,
+          { response: response.content, toolCalls: response.tool_calls?.map((tc) => ({ name: tc.function.name, args: safeArgs(tc) })), threadId, round },
+          { runAll: guardrails.runAll, haltOn: guardrails.haltOn, span: roundSpan ?? undefined },
+        );
+        if (shouldHalt(outputViolations, guardrails.haltOn)) {
+          if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan, { error: "Output guardrail halted" }));
+          if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan, { error: "Output guardrail halted" }));
+          if (tracer) await tracer.export(spansToExport);
+          yield { type: "error", message: `Output guardrail violation(s): ${outputViolations.map((v) => v.guardrail).join(", ")}`, fatal: true };
+          return;
         }
       }
 
@@ -516,24 +338,27 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
       decision = await hitlGate.wait(resumeKey);
     }
 
-    if (decision && applyHitlDecision(decision, history) === "stop") {
-      await checkpointer.save(threadId, { messages: history, round });
-      yield { type: "checkpoint", round, threadId };
-      if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan));
-      if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan));
-      if (tracer) await tracer.export(spansToExport);
-      yield {
-        type: "done",
-        response: response.content,
-        reasoning: response.reasoning_content ?? "",
-        toolCount: totalTools,
-        history,
-        inputTokens: totalInputTokens,
-        outputTokens: totalOutputTokens,
-        costUsd: provider.estimateCost?.(totalInputTokens, totalOutputTokens) ?? estimateCost(model, totalInputTokens, totalOutputTokens),
-        durationMs: Date.now() - loopStartMs,
-      };
-      return;
+    if (decision) {
+      history = applyHitlDecision(decision, history);
+      if (decision.type === "reject") {
+        await checkpointer.save(threadId, { messages: history, round });
+        yield { type: "checkpoint", round, threadId };
+        if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan));
+        if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan));
+        if (tracer) await tracer.export(spansToExport);
+        yield {
+          type: "done",
+          response: response.content,
+          reasoning: response.reasoning_content ?? "",
+          toolCount: totalTools,
+          history,
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+          costUsd: provider.estimateCost?.(totalInputTokens, totalOutputTokens) ?? estimateCost(model, totalInputTokens, totalOutputTokens),
+          durationMs: Date.now() - loopStartMs,
+        };
+        return;
+      }
     }
 
     let toolCallsThisRound = 0;
@@ -545,11 +370,11 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         yield { type: "tool-error", id: toolCall.id, name, error: message, willRetry: false };
-        history.push({
+        history = [...history, {
           role: "tool",
           tool_call_id: toolCall.id,
           content: `Error: ${message}`,
-        });
+        }];
         continue;
       }
 
@@ -564,7 +389,7 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
         }
       }
       if (cancelled) {
-        history.push({ role: "tool", tool_call_id: toolCall.id, content: cancelled.result });
+        history = [...history, { role: "tool", tool_call_id: toolCall.id, content: cancelled.result }];
         yield { type: "tool-done", id: toolCall.id, name, result: cancelled.result, durationMs: 0 };
         toolCallsThisRound += 1;
         continue;
@@ -579,6 +404,21 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
         parentSpanId: roundSpan?.spanId,
         attributes: { "agent.tool_name": name, "agent.thread_id": threadId },
       });
+
+      // Tool guardrails
+      if (guardrails?.tools && guardrails.tools.length > 0) {
+        const toolViolations = yield* runGuardrailChecks(
+          guardrails.tools,
+          { toolName: name, args, threadId, round },
+          { runAll: guardrails.runAll, haltOn: guardrails.haltOn, span: toolSpan ?? undefined },
+        );
+        if (shouldHalt(toolViolations, guardrails.haltOn)) {
+          if (toolSpan) spansToExport.push(tracer!.endSpan(toolSpan, { error: "Tool guardrail halted" }));
+          history = [...history, { role: "tool", tool_call_id: toolCall.id, content: `Guardrail blocked: ${toolViolations.map((v) => v.message).join("; ")}` }];
+          yield { type: "tool-error", id: toolCall.id, name, error: `Guardrail blocked: ${toolViolations.map((v) => v.guardrail).join(", ")}`, willRetry: false };
+          continue;
+        }
+      }
 
       try {
         const { result: rawResult, attempts } = await executeToolCall(toolCall, toolsByName);
@@ -596,11 +436,11 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
           if (transformed !== undefined) result = transformed;
         }
 
-        history.push({
+        history = [...history, {
           role: "tool",
           tool_call_id: toolCall.id,
           content: result,
-        });
+        }];
         yield {
           type: "tool-done",
           id: toolCall.id,
@@ -609,13 +449,45 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
           durationMs,
         };
       } catch (error) {
+        if (error instanceof HandoffSignal) {
+          // First-class handoff: push synthetic tool result, yield handoff + done, and exit.
+          history = [...history, {
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: `[Handoff to ${error.targetAgent}]`,
+          }];
+          yield {
+            type: "handoff",
+            targetAgent: error.targetAgent,
+            taskDescription: error.taskDescription,
+            artifacts: error.artifacts,
+            reasoning: error.reasoning,
+          };
+          if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan));
+          if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan));
+          if (tracer) await tracer.export(spansToExport);
+          await checkpointer.save(threadId, { messages: history, round });
+          yield { type: "checkpoint", round, threadId };
+          yield {
+            type: "done",
+            response: response?.content ?? "",
+            reasoning: response?.reasoning_content ?? "",
+            toolCount: totalTools,
+            history,
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            costUsd: provider.estimateCost?.(totalInputTokens, totalOutputTokens) ?? estimateCost(model, totalInputTokens, totalOutputTokens),
+            durationMs: Date.now() - loopStartMs,
+          };
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         if (toolSpan) spansToExport.push(tracer!.endSpan(toolSpan, { error: message }));
-        history.push({
+        history = [...history, {
           role: "tool",
           tool_call_id: toolCall.id,
           content: `Error: ${message}`,
-        });
+        }];
         yield {
           type: "tool-error",
           id: toolCall.id,
@@ -630,10 +502,13 @@ export async function* runAgentLoop(options: LoopOptions): AsyncGenerator<AgentE
     // Middleware: afterRound
     const afterCtx: RoundContext = { round, threadId, model, history, toolCallsThisRound };
     await runMiddleware(middleware, "afterRound", afterCtx);
+    yield { type: "middleware-after", round, hook: "afterRound" };
 
     if (roundSpan) spansToExport.push(tracer!.endSpan(roundSpan));
     await checkpointer.save(threadId, { messages: history, round });
     yield { type: "checkpoint", round, threadId };
+    yield { type: "checkpoint-saved", round, threadId };
+    yield { type: "round-end", round, threadId, toolCallsThisRound };
   }
 
   if (loopSpan) spansToExport.push(tracer!.endSpan(loopSpan, { error: `Exceeded max rounds (${maxRounds})` }));

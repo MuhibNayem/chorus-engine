@@ -109,7 +109,7 @@ export class SkillMiddleware implements AgentMiddleware {
     });
 
     if (trajectory.tools.length > 0) {
-      this.synthesizer.observe(trajectory);
+      await this.synthesizer.observe(trajectory);
     }
 
     this.harness.updateMetrics();

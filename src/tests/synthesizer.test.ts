@@ -112,13 +112,13 @@ describe("TrajectorySynthesizer — data integrity tests", () => {
     expect(traj.tools.length).toBe(0);
   });
 
-  it("caps trajectories at maxTrajectories", () => {
+  it("caps trajectories at maxTrajectories", async () => {
     const smallSynth = new TrajectorySynthesizer(registry as any, {
       maxTrajectories: 3,
     });
 
     for (let i = 0; i < 5; i++) {
-      smallSynth.observe({
+      await smallSynth.observe({
         id: `t${i}`,
         task: "task",
         tools: [],
@@ -129,38 +129,39 @@ describe("TrajectorySynthesizer — data integrity tests", () => {
       });
     }
 
-    // Access private field via reflection for test verification
-    expect((smallSynth as any).trajectories.length).toBe(3);
-    expect((smallSynth as any).trajectories[0].id).toBe("t2"); // oldest kept
-    expect((smallSynth as any).trajectories[2].id).toBe("t4"); // newest
+    // Access store via reflection for test verification
+    const storeTrajectories = (smallSynth as any).store.trajectories as { id: string }[];
+    expect(storeTrajectories.length).toBe(3);
+    expect(storeTrajectories[0].id).toBe("t2"); // oldest kept
+    expect(storeTrajectories[2].id).toBe("t4"); // newest
   });
 
-  it("computes similarity 1.0 for identical sequences", () => {
+  it("computes similarity 1.0 for identical sequences", async () => {
     const t1 = { id: "a", task: "t", tools: [{ name: "x", input: {}, output: "" }], success: true, tokens: 0, duration: 0, timestamp: 0 };
     const t2 = { id: "b", task: "t", tools: [{ name: "x", input: {}, output: "" }], success: true, tokens: 0, duration: 0, timestamp: 0 };
-    (synth as any).trajectories = [t1];
-    const similar = (synth as any).findSimilar(t2);
+    await (synth as any).store.append(t1);
+    const similar = await (synth as any).findSimilar(t2);
     expect(similar.length).toBe(1);
   });
 
-  it("computes similarity 1.0 for both empty sequences (division by zero guard)", () => {
+  it("computes similarity 1.0 for both empty sequences (division by zero guard)", async () => {
     const t1 = { id: "a", task: "t", tools: [], success: true, tokens: 0, duration: 0, timestamp: 0 };
     const t2 = { id: "b", task: "t", tools: [], success: true, tokens: 0, duration: 0, timestamp: 0 };
-    (synth as any).trajectories = [t1];
-    const similar = (synth as any).findSimilar(t2);
+    await (synth as any).store.append(t1);
+    const similar = await (synth as any).findSimilar(t2);
     expect(similar.length).toBe(1);
   });
 
-  it("does not synthesize from failed trajectories", () => {
+  it("does not synthesize from failed trajectories", async () => {
     const patterns: any[] = [];
     const mockRegistry = {
-      registerPattern: (p: any) => patterns.push(p),
+      registerPattern: async (p: any) => patterns.push(p),
       savePattern: () => "",
     };
     const s = new TrajectorySynthesizer(mockRegistry as any, { minTrajectories: 2 });
 
     for (let i = 0; i < 3; i++) {
-      s.observe({
+      await s.observe({
         id: `f${i}`,
         task: "fail",
         tools: [{ name: "x", input: {}, output: "" }],

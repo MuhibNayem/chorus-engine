@@ -105,7 +105,7 @@ export type { EvalRunnerConfig } from "./evals/runner.js";
 
 // ── Harness (pre-flight workers) ──────────────────────────────────────────────
 export { executeWorkers, formatWorkerResults } from "./harness/workerEngine.js";
-export { prepareTaskExecution } from "./harness/orchestrator.js";
+export { prepareTaskExecution, prepareTaskExecutionAsync } from "./harness/orchestrator.js";
 export { SemanticTaskRouter, routeTaskSemantic } from "./harness/semanticRouter.js";
 export type {
   WorkerEvent,

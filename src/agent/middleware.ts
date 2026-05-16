@@ -49,7 +49,7 @@ export interface AgentMiddleware {
    */
   beforeTool?(ctx: BeforeToolContext): Promise<void | { cancel: true; result: string }>;
   afterTool?(ctx: ToolResultContext): Promise<string | undefined>;
-  maybeCompact?(history: ChatMessage[], opts: { model: string; systemPrompt: string }): Promise<CompactResult | null>;
+  maybeCompact?(history: readonly ChatMessage[], opts: { model: string; systemPrompt: string }): Promise<CompactResult | null>;
   afterRound?(ctx: RoundContext): Promise<void>;
   extraTools?(): AgentTool[];
   extraSystemPrompt?(): string;
@@ -73,7 +73,7 @@ export class SummarizationMiddleware implements AgentMiddleware {
   }
 
   async maybeCompact(
-    history: ChatMessage[],
+    history: readonly ChatMessage[],
     opts: { model: string; systemPrompt: string },
   ): Promise<CompactResult | null> {
     const contextWindow = getContextWindow(opts.model);

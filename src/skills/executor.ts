@@ -8,6 +8,9 @@
 
 import type { SkillDef, PatternDef, SkillExecutionResult, SkillWorkflowStep } from "./types.js";
 import type { AgentTool } from "../agent/types.js";
+import type { LLMProvider } from "../llm/provider.js";
+import { runSwarm } from "../swarm/orchestrator.js";
+import type { SwarmConfig, SwarmAgent } from "../swarm/types.js";
 
 /** Substitute {{parameter}} placeholders in workflow inputs. */
 function substituteParams(
@@ -129,12 +132,83 @@ export async function executePatternWorkflow(
   }
 }
 
+/** Build a SwarmConfig from a skill's swarm declaration. */
+function buildSwarmConfig(skill: SkillDef, params: Record<string, unknown>, provider: LLMProvider, modelName: string): SwarmConfig {
+  const swarm = skill.swarm!;
+  const agents: SwarmAgent[] = (swarm.agents ?? []).map((a) => ({
+    name: a.role,
+    description: a.description,
+    systemPrompt: a.description,
+    tools: [],
+    handoffDestinations: [],
+    contextMode: "filtered",
+    maxRounds: 30,
+    model: a.model,
+  }));
+
+  // Sequential handoff: each agent hands off to the next
+  if (swarm.handoff?.strategy === "sequential" && agents.length > 1) {
+    for (let i = 0; i < agents.length - 1; i++) {
+      agents[i].handoffDestinations.push(agents[i + 1].name);
+    }
+  }
+
+  return {
+    agents,
+    initialAgent: agents[0]?.name ?? "",
+    task: (params.task as string) || skill.description || `Execute skill: ${skill.name}`,
+    provider,
+    modelName,
+    executionModel: swarm.handoff?.strategy === "parallel" ? "graph" : "handoff",
+    policy: "full_auto",
+  };
+}
+
+/** Merge swarm events into a single execution result. */
+function mergeSwarmResults(events: AsyncGenerator<import("../swarm/types.js").SwarmEvent>, mergeStrategy: string): Promise<{ output: string; tokensUsed: number; swarmResults: Array<{ agent: string; output: string }> }> {
+  return new Promise(async (resolve, reject) => {
+    const agentOutputs: Record<string, string> = {};
+    let tokensUsed = 0;
+
+    try {
+      for await (const event of events) {
+        if (event.type === "agent-done") {
+          agentOutputs[event.agent] = event.responseText;
+        }
+        if (event.type === "done" && "inputTokens" in event) {
+          tokensUsed += (event.inputTokens ?? 0) + (event.outputTokens ?? 0);
+        }
+      }
+
+      const results = Object.entries(agentOutputs).map(([agent, output]) => ({ agent, output }));
+      let output: string;
+
+      switch (mergeStrategy) {
+        case "vote":
+          output = `Swarm results (${results.length} agents):\n\n${results.map((r) => `--- ${r.agent} ---\n${r.output}`).join("\n\n")}`;
+          break;
+        case "first_success":
+          output = results.find((r) => r.output.length > 0)?.output ?? "No successful agent output.";
+          break;
+        case "concatenate_results":
+        default:
+          output = `Swarm results (${results.length} agents):\n\n${results.map((r) => `--- ${r.agent} ---\n${r.output}`).join("\n\n")}`;
+          break;
+      }
+
+      resolve({ output, tokensUsed, swarmResults: results });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
 /** Execute a skill with swarm orchestration. */
 export async function executeSkillWithSwarm(
   skill: SkillDef,
   params: Record<string, unknown>,
-  // TODO: In Phase D, integrate with src/swarm/orchestrator.ts
-  // For now, returns a placeholder indicating swarm execution is needed
+  provider: LLMProvider,
+  modelName: string,
 ): Promise<SkillExecutionResult> {
   const start = Date.now();
 
@@ -147,22 +221,17 @@ export async function executeSkillWithSwarm(
     };
   }
 
-  // Placeholder: Actual swarm integration requires importing the swarm orchestrator,
-  // which would create a circular dependency. The integration point is designed but
-  // deferred to avoid coupling issues. When integrated, this function will:
-  //   1. Build a SwarmConfig from skill.swarm declaration
-  //   2. Call runSwarm() with the config
-  //   3. Merge swarm results into a single output
+  const config = buildSwarmConfig(skill, params, provider, modelName);
+  const events = runSwarm(config);
+  const mergeStrategy = skill.swarm.handoff?.merge ?? "concatenate_results";
+  const { output, tokensUsed, swarmResults } = await mergeSwarmResults(events, mergeStrategy);
 
   return {
     success: true,
-    output: `Swarm execution for "${skill.name}" would spawn ${skill.swarm.agents?.length ?? 0} agents.`,
-    tokensUsed: 0,
+    output,
+    tokensUsed,
     durationMs: Date.now() - start,
-    swarmResults: skill.swarm.agents?.map((a) => ({
-      agent: a.role,
-      output: `[Placeholder] Agent ${a.role} result`,
-    })),
+    swarmResults,
   };
 }
 
@@ -171,10 +240,20 @@ export async function executeSkill(
   skill: SkillDef | PatternDef,
   params: Record<string, unknown>,
   toolsByName: Map<string, AgentTool>,
+  provider?: LLMProvider,
+  modelName?: string,
 ): Promise<SkillExecutionResult> {
   // Check if it's a skill with swarm mode
   if ("swarm" in skill && skill.swarm?.enabled) {
-    return executeSkillWithSwarm(skill as SkillDef, params);
+    if (!provider || !modelName) {
+      return {
+        success: false,
+        output: "Swarm execution requires provider and modelName parameters",
+        tokensUsed: 0,
+        durationMs: 0,
+      };
+    }
+    return executeSkillWithSwarm(skill as SkillDef, params, provider, modelName);
   }
 
   // Check if it's a pattern with a workflow

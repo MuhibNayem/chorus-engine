@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { executeWorkers, formatWorkerResults, prepareTaskExecution } from "../index.js";
+import { executeWorkers, formatWorkerResults, prepareTaskExecution, prepareTaskExecutionAsync } from "../index.js";
 import type { LLMProvider } from "../llm/provider.js";
 import type { WorkerExecutionResult } from "../harness/workerEngine.js";
 import type { ProviderName } from "../llm/config.js";
@@ -262,5 +262,42 @@ describe("prepareTaskExecution — task routing", () => {
       messages: [{ role: "user", content: "Fix the null pointer exception in utils.js" }],
     });
     expect(prepared.route.kind).toBe("single_file_edit");
+  });
+});
+
+describe("prepareTaskExecutionAsync — semantic routing", () => {
+  it("classifies a research task via semantic router", async () => {
+    const prepared = await prepareTaskExecutionAsync({
+      text: "What is the latest version of React?",
+      expandedText: "What is the latest version of React?",
+      basePrompt: "",
+      messages: [{ role: "user", content: "What is the latest version of React?" }],
+    });
+    expect(prepared.route.kind).toBe("research");
+    expect(prepared.route.requiresResearch).toBe(true);
+  });
+
+  it("classifies a simple question as answer_only via semantic router", async () => {
+    const prepared = await prepareTaskExecutionAsync({
+      text: "What is 2+2?",
+      expandedText: "What is 2+2?",
+      basePrompt: "",
+      messages: [{ role: "user", content: "What is 2+2?" }],
+    });
+    expect(prepared.route.kind).toBe("answer_only");
+  });
+
+  it("falls back to regex when semantic confidence is low", async () => {
+    // A very unusual utterance that won't match any prototype well
+    const prepared = await prepareTaskExecutionAsync({
+      text: "xyz123 nonsense string that matches no prototype",
+      expandedText: "xyz123 nonsense string that matches no prototype",
+      basePrompt: "",
+      messages: [{ role: "user", content: "xyz123 nonsense string that matches no prototype" }],
+    });
+    // Should still produce a valid route (fallback regex)
+    expect(prepared.route.kind).toBeDefined();
+    expect(prepared.route.lane).toBeDefined();
+    expect(prepared.route.path).toBeDefined();
   });
 });

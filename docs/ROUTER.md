@@ -14,7 +14,7 @@ Embedding-based classification maps the query into the same vector space as rout
 ## Usage
 
 ```typescript
-import { SemanticTaskRouter, routeTaskSemantic } from "@chorus/engine/harness";
+import { SemanticTaskRouter, routeTaskSemantic } from "chorus-engine/harness";
 
 // One-shot classification
 const route = await routeTaskSemantic({ text: "Debug the login flow" });

@@ -86,9 +86,9 @@ export interface WorkerExecutionOptions {
   onEvent: WorkerEventCallback;
   parentTurnId: string;
   /**
-   * Maximum concurrent workers. Default: Infinity (all assignments in parallel).
-   * Set to 1 for sequential execution, or to a small number (2-4) to avoid
-   * provider rate limits while still getting parallelism.
+   * Maximum concurrent workers. Default: 3 (balanced parallelism without
+   * overwhelming provider rate limits). Set to 1 for sequential execution,
+   * or increase for higher throughput on high-capacity providers.
    */
   concurrency?: number;
   /**
@@ -370,7 +370,7 @@ export async function executeWorkers(
 
   const sharedContext = options.sharedContext ?? new InMemorySharedContext();
   const mode = options.executionMode ?? "parallel";
-  const concurrency = options.concurrency ?? Infinity;
+  const concurrency = options.concurrency ?? 3;
 
   if (mode === "pipeline") {
     return executePipeline(options.assignments, options, sharedContext);

@@ -34,17 +34,28 @@ import { InProcessTracer } from "../telemetry/inprocess.js";
  * completion order, not declaration order. Exceptions in any generator are
  * surfaced as `error` events rather than propagating (so one failing agent
  * does not silently cancel its wave siblings).
+ *
+ * Cleanup contract:
+ *   • Accepts an AbortSignal for external cancellation.
+ *   • When the caller stops iterating (break/return/throw), the `finally`
+ *     block calls `.return()` on every underlying iterator so background
+ *     generators close promptly and release resources.
+ *   • Background tasks are awaited before the generator returns, preventing
+ *     unhandled promise rejections and generator leaks.
  */
 async function* mergeGenerators<T extends SwarmEvent>(
   gens: AsyncGenerator<T>[],
+  signal?: AbortSignal,
 ): AsyncGenerator<T> {
   if (gens.length === 0) return;
 
   const queue: T[] = [];
   let waiting: (() => void) | null = null;
   let done = 0;
+  let cancelled = false;
 
   function enqueue(item: T): void {
+    if (cancelled) return;
     queue.push(item);
     if (waiting) {
       const w = waiting;
@@ -62,32 +73,80 @@ async function* mergeGenerators<T extends SwarmEvent>(
     }
   }
 
-  for (const gen of gens) {
-    void (async () => {
-      try {
-        for await (const item of gen) {
-          enqueue(item);
-        }
-      } catch (err) {
+  const abortHandler = (): void => {
+    cancelled = true;
+    if (waiting) {
+      const w = waiting;
+      waiting = null;
+      w();
+    }
+  };
+
+  signal?.addEventListener("abort", abortHandler, { once: true });
+
+  // Obtain direct iterator references so we can call .return() on cleanup.
+  const iterators = gens.map((gen) => gen[Symbol.asyncIterator]() as AsyncGenerator<T>);
+
+  const tasks = iterators.map(async (iter) => {
+    try {
+      while (!cancelled) {
+        const result = await iter.next();
+        if (result.done) break;
+        enqueue(result.value);
+      }
+    } catch (err) {
+      if (!cancelled) {
         enqueue({
           type: "circuit-break",
           agent: "unknown",
           reason: `Generator error: ${String(err)}`,
         } as unknown as T);
-      } finally {
-        finish();
       }
-    })();
-  }
-
-  while (done < gens.length || queue.length > 0) {
-    if (queue.length > 0) {
-      yield queue.shift()!;
-    } else {
-      await new Promise<void>((resolve) => {
-        waiting = resolve;
-      });
+    } finally {
+      finish();
     }
+  });
+
+  try {
+    while (done < gens.length && !cancelled) {
+      if (queue.length > 0) {
+        yield queue.shift()!;
+      } else {
+        await new Promise<void>((resolve) => {
+          waiting = resolve;
+        });
+      }
+    }
+
+    // Drain remaining queue after cancellation or normal completion.
+    while (queue.length > 0 && !cancelled) {
+      yield queue.shift()!;
+    }
+  } finally {
+    cancelled = true;
+    signal?.removeEventListener("abort", abortHandler);
+    // Signal every underlying iterator to close so generators unwind.
+    await Promise.all(
+      iterators.map(async (iter) => {
+        try {
+          if (iter.return) {
+            await iter.return(undefined);
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }),
+    );
+    // Wait for background consumption tasks to settle.
+    await Promise.all(
+      tasks.map(async (task) => {
+        try {
+          await task;
+        } catch {
+          // ignore
+        }
+      }),
+    );
   }
 }
 
@@ -480,7 +539,7 @@ export async function* runSwarmGraph(config: SwarmConfig): AsyncGenerator<SwarmE
     });
 
     let circuitTripped = false;
-    for await (const event of mergeGenerators(gens)) {
+    for await (const event of mergeGenerators(gens, waveSignal)) {
       tracer.record(event);
       globalBroadcaster.broadcastSwarmEvent(swarmId, event);
       yield event;

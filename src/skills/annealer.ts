@@ -110,10 +110,21 @@ function kMedoids(
   const n = distMatrix.length;
   if (k >= n) return distMatrix.map((_, i) => [i]);
 
-  // Random initialization without replacement
+  // Deterministic farthest-first initialization for diversity
   const medoids = new Set<number>();
+  medoids.add(0); // start with first point
   while (medoids.size < k) {
-    medoids.add(Math.floor(Math.random() * n));
+    let bestIdx = 0;
+    let bestDist = -1;
+    for (let i = 0; i < n; i++) {
+      if (medoids.has(i)) continue;
+      const minDistToMedoids = Math.min(...[...medoids].map((m) => distMatrix[i][m]));
+      if (minDistToMedoids > bestDist) {
+        bestDist = minDistToMedoids;
+        bestIdx = i;
+      }
+    }
+    medoids.add(bestIdx);
   }
   let medoidArray = [...medoids];
 
